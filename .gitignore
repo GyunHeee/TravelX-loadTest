@@ -1,0 +1,15 @@
+# 실제 secret/설정값 — infra 레포에서 매번 로컬로만 가져와 사용, 커밋하지 않음
+env/configmap.env
+env/secret.env
+
+# seed.sh가 생성하는 토큰/슬롯 정보 — 매 실행마다 새로 생성되고, 유저 JWT를 담고 있어 커밋 금지
+k6/tokens.json
+k6/spread-slots.json
+k6/hot-slot.json
+
+# k6 실행 결과물 (폴더 자체는 .gitkeep으로 유지)
+results/*
+!results/.gitkeep
+
+node_modules/
+.DS_Store
