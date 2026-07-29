@@ -10,7 +10,15 @@
 // A/B0/B1은 서로 다른 슬롯(시간대)을 쓴다 — 같은 슬롯을 재사용하면 앞 시나리오가
 // 정원 6을 다 소진해버려서 뒤 시나리오가 처음부터 "슬롯 꽉 참"으로만 나오기 때문이다.
 //
-// 실행 전 scripts/seed.sh로 tokens.json / hot-slot.json / spread-slots.json을 먼저 생성할 것.
+// 유저 풀: A/B0/B1/C는 서로 겹치지 않는 전용 유저 구간을 쓴다(tokens.json 안에서
+// token-counts.json 순서대로 연속 슬라이스). 예전엔 20명을 4개 시나리오에서 모듈러로
+// 재사용했는데, A에서 성공한 유저는 PENDING_PAYMENT 예약을 쥔 채 남아있어 뒤이은
+// 시나리오에서 CONCURRENT_PENDING_PAYMENT_LIMIT(C304)에 걸릴 수 있었다 — 어떤 토큰이
+// A에서 이길지는 레이스라 재현성도 없이 락/풀 대기 측정이 오염됐다. 겹치지 않는 구간을
+// 쓰면 이 오염 자체가 구조적으로 불가능해진다.
+//
+// 실행 전 scripts/seed.sh로 tokens.json / token-counts.json / hot-slot.json /
+// spread-slots.json을 먼저 생성할 것.
 import http from 'k6/http';
 import { check } from 'k6';
 import exec from 'k6/execution';
@@ -18,8 +26,16 @@ import exec from 'k6/execution';
 const BASE_URL = __ENV.BASE_URL || 'http://localhost:8090';
 
 const TOKENS = JSON.parse(open('./tokens.json'));
+const COUNTS = JSON.parse(open('./token-counts.json')); // { a, b0, b1, c } — seed.sh와 반드시 동일해야 함
 const SPREAD_SLOTS = JSON.parse(open('./spread-slots.json'));
 const HOT = JSON.parse(open('./hot-slot.json')); // { branchId, date, aTime, b0Time, b1Time }
+
+// seed.sh가 만든 순서(A → B0 → B1 → C) 그대로 누적 오프셋을 계산한다 — 카운트를 바꿔도
+// 두 파일이 같은 token-counts.json을 보는 한 항상 서로 다른 구간을 가리킨다.
+const OFFSET_A = 0;
+const OFFSET_B0 = OFFSET_A + COUNTS.a;
+const OFFSET_B1 = OFFSET_B0 + COUNTS.b0;
+const OFFSET_C = OFFSET_B1 + COUNTS.b1;
 
 const SLOT_BY_SCENARIO = {
   a_correctness: { date: HOT.date, time: HOT.aTime },
@@ -27,38 +43,48 @@ const SLOT_BY_SCENARIO = {
   b1_pool_exceed_contended: { date: HOT.date, time: HOT.b1Time },
 };
 
+const TOKEN_OFFSET_BY_SCENARIO = {
+  a_correctness: OFFSET_A,
+  b0_pool_safe_contended: OFFSET_B0,
+  b1_pool_exceed_contended: OFFSET_B1,
+  c_pool_exceed_spread: OFFSET_C,
+};
+
 export const options = {
   scenarios: {
     a_correctness: {
       executor: 'per-vu-iterations',
-      vus: 20,
+      vus: COUNTS.a,
       iterations: 1,
       exec: 'reserve',
       startTime: '0s',
     },
     b0_pool_safe_contended: {
       executor: 'per-vu-iterations',
-      vus: 6,
+      vus: COUNTS.b0,
       iterations: 1,
       exec: 'reserve',
       startTime: '20s',
     },
     b1_pool_exceed_contended: {
       executor: 'per-vu-iterations',
-      vus: 20,
+      vus: COUNTS.b1,
       iterations: 1,
       exec: 'reserve',
       startTime: '40s',
     },
     c_pool_exceed_spread: {
       executor: 'per-vu-iterations',
-      vus: 20,
+      vus: COUNTS.c,
       iterations: 1,
       exec: 'reserve',
       startTime: '60s',
     },
   },
   thresholds: {
+    // 실배포 대상은 nginx 리버스 프록시 + TLS를 거치므로 로컬 Docker 직결보다 기본 RTT가
+    // 더 크다. 최초 실행에서는 이 임계치를 하드 실패가 아니라 관찰 기준으로 보고, 실측
+    // 후 재조정할 것.
     'http_req_duration{scenario:b0_pool_safe_contended}': ['p(95)<300'],
     // HIKARI_CONNECTION_TIMEOUT=3000ms이므로 풀 초과 시나리오는 이보다 커도 실패로 보지 않는다 —
     // 임계치는 "타임아웃으로 전부 죽지는 않는다"를 확인하는 정도로 느슨하게 잡는다.
@@ -69,7 +95,8 @@ export const options = {
 
 export function reserve() {
   const scenarioName = exec.scenario.name;
-  const token = TOKENS[(__VU - 1) % TOKENS.length];
+  const tokenIndex = TOKEN_OFFSET_BY_SCENARIO[scenarioName] + (__VU - 1);
+  const token = TOKENS[tokenIndex];
 
   const slot =
     scenarioName === 'c_pool_exceed_spread'

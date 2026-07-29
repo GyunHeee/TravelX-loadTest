@@ -2,12 +2,13 @@
 
 TravelX(환전 예약 플랫폼) 백엔드의 슬롯 예약 동시성 설계를
 [vietnam-internship/server Discussion #13](https://github.com/vietnam-internship/server/discussions/13)에서
-비관적 락(방안 A)으로 제안했다. 이 저장소는 그 제안이 실제 배포 스펙
+비관적 락(방안 A)으로 제안했다. 이 저장소는 그 제안이 실제 배포 환경
 ([vietnam-internship/infra](https://github.com/vietnam-internship/infra))에서도 유효한지
 k6로 직접 검증한 기록이다.
 
-라이브 서버는 건드리지 않고, 로컬에 **동일한 리소스 제약(CPU 0.5, 메모리 768Mi,
-HikariCP 풀 8개)을 Docker로 복제**해 테스트한다.
+**이번 라운드부터는 로컬 복제가 아니라 실제 배포된 단일 인스턴스를 대상으로 직접
+실행한다** (별도 staging 환경이 없어 사실상 유일한 실서버). 그만큼 안전장치가
+전제조건이므로, 실행 전 반드시 [안전 수칙](#안전-수칙--실배포-대상-필수)을 먼저 읽을 것.
 
 ---
 
@@ -23,15 +24,79 @@ HikariCP 풀 8개)을 Docker로 복제**해 테스트한다.
 
 ---
 
+## 이번 라운드에서 바뀐 것
+
+- **대상**: 로컬 Docker 복제 → [vietnam-internship/infra](https://github.com/vietnam-internship/infra)로
+  배포된 실제 단일 인스턴스. 별도 staging 클러스터/DB는 없다(서버 코드에
+  `application-staging.yml`이 있지만 실제로 배포되는 곳은 `SPRING_PROFILES_ACTIVE=prod` 하나뿐).
+- **유저 풀 오염 버그 수정**: 예전엔 A(VU=20)/B0(VU=6)/B1(VU=20)이 같은 20명의 토큰을
+  `(__VU-1) % 20`으로 재사용했다. A에서 성공한 6명은 결제 웹훅을 안 태워 `PENDING_PAYMENT`
+  예약을 쥔 채 남는데, 이 유저가 B0/B1에서 다시 뽑히면 락/풀 대기가 아니라
+  `CONCURRENT_PENDING_PAYMENT_LIMIT`(C304)로 막혀 **순수 락 대기 측정이 오염**된다. 게다가
+  어떤 토큰이 A에서 이길지는 레이스라 재현성도 없었다. → **시나리오별로 겹치지 않는 유저
+  구간**(총 66명: A 20 / B0 6 / B1 20 / C 20)을 쓰도록 `seed.sh`/`scenario.js`를 고쳤다.
+- **실사용자 노출 차단**: 테스트 지점을 생성 직후 `active=false`로 비활성화해 공개
+  `GET /branches` 목록에서 숨긴다(예약 생성은 `branchId`를 직접 지정하므로 영향 없음).
+- **클린업 스크립트 추가**(`scripts/cleanup.sh`): 실배포 DB에 테스트 데이터가 남으므로,
+  종료 후 되돌릴 수 있는 것(재고)은 자동으로 되돌리고, 나머지는 검토용 SQL만 출력한다.
+- **관측 명령**: `docker exec`/`docker stats` → `kubectl exec`/`kubectl top pod`
+  (infra의 [`redeploy.sh`](https://github.com/vietnam-internship/infra/blob/main/redeploy.sh) 관례에 맞춰
+  `sudo kubectl`, `KUBECONFIG=/etc/rancher/k3s/k3s.yaml` 사용).
+
+---
+
+## 안전 수칙 (실배포 대상 — 필수)
+
+실배포 인프라의 실제 특성(모두 [vietnam-internship/infra](https://github.com/vietnam-internship/infra) 확인):
+
+- **단일 VM, 단일 replica, HPA 없음** — 부하테스트 트래픽이 실사용자 트래픽과 완전히
+  같은 CPU(500m)/메모리(768Mi)/HikariCP 풀(8)을 공유한다. 테스트 시간 동안 실사용자
+  응답이 느려질 수 있다.
+- **MySQL도 자체 파드(PVC)** — RDS 같은 관리형 DB가 아니라 같은 클러스터의 파드다.
+  DB 부하도 실사용자와 그대로 공유된다.
+- **`DEV_AUTH_ENABLED`는 prod configmap에 `false`로 고정, 명시적 경고 있음**
+  (`k8s/configmap.env`: "운영에서 켜두면 인증 우회 엔드포인트가 그대로 열려버리므로
+  절대 true로 바꾸지 말 것"). 테스트를 위해 이 값을 켜는 것은 **의도적인 예외**이지
+  기본값이 아니다 — 아래처럼 최소 시간만 켜고 즉시 되돌린다.
+- **`travelx-server` Deployment는 `Recreate` 전략** (hostPort 8080을 쓰기 때문에
+  RollingUpdate 불가). 즉 `DEV_AUTH_ENABLED`를 켜고 끌 때마다 파드가 재기동되며
+  **매번 수십 초~최대 수 분(startupProbe `failureThreshold: 30 × periodSeconds: 5`)의
+  실다운타임**이 발생한다 — on/off 두 번이면 다운타임도 두 번이다.
+
+### 체크리스트
+
+1. **트래픽이 가장 적은 시간대**에 진행한다.
+2. `DEV_AUTH_ENABLED`를 켠다 (VM에서 직접, infra 레포의 커밋된 `configmap.env`는 건드리지
+   않고 배포 스펙만 일시적으로 오버라이드 — 되돌리기 쉽게):
+   ```bash
+   sudo KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl set env deployment/travelx-server DEV_AUTH_ENABLED=true
+   sudo KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl rollout status deployment/travelx-server --timeout=180s
+   curl -sf https://api.knu80th.shop/actuator/health
+   ```
+3. `scripts/seed.sh` 실행 → `k6 run` 실행 → 결과 확인.
+4. **테스트 결과와 무관하게 즉시** `DEV_AUTH_ENABLED`를 되돌린다:
+   ```bash
+   sudo KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl set env deployment/travelx-server DEV_AUTH_ENABLED=false
+   sudo KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl rollout status deployment/travelx-server --timeout=180s
+   ```
+5. `scripts/cleanup.sh`로 테스트 지점 재고 정리 (테스트 예약 자체는 서버의 기존
+   `ReservationExpirySweeper`가 5분 TTL로 자동 정리 — 결제 웹훅을 안 태우므로 전부
+   `PENDING_PAYMENT → EXPIRED` 경로를 탄다).
+6. 테스트 중 `kubectl top pod`와 실사용자向 에러율을 병행 관찰하다가, 이상 징후가 보이면
+   즉시 k6를 중단(`Ctrl+C`)하고 3~4번을 먼저 실행한다.
+
+---
+
 ## 저장소 구성
 
 ```
 .
 ├── README.md              # 이 문서 — 설계 배경과 실행 방법
 ├── env/
-│   └── configmap.env.example   # infra 레포에서 가져와야 하는 값 목록(값 자체는 포함 안 함)
+│   └── configmap.env.example   # (선택) 로컬 리허설용 — infra 레포 값 목록, 값 자체는 포함 안 함
 ├── scripts/
-│   └── seed.sh             # 지점/재고/슬롯/테스트 유저 토큰 생성
+│   ├── seed.sh             # 지점/재고/슬롯/테스트 유저 토큰(66명) 생성
+│   └── cleanup.sh          # 테스트 지점 재고 정리 + 행 삭제용 SQL 출력(수동 실행)
 └── k6/
     └── scenario.js         # 부하테스트 시나리오 (A/B0/B1/C)
 ```
@@ -52,9 +117,10 @@ HikariCP 풀 8개)을 Docker로 복제**해 테스트한다.
 
 ---
 
-## 테스트 환경 — 실제 배포 스펙 재현
+## A. (선택) 로컬 리허설 — 실배포 실행 전 먼저 검증 권장
 
-### 1. 앱 컨테이너
+실배포에 영향을 주지 않고 스크립트/시나리오 자체가 의도대로 도는지 먼저 확인하고
+싶다면, 동일 리소스 제약을 Docker로 복제해 리허설한다.
 
 ```bash
 docker network create travelx-net
@@ -78,20 +144,27 @@ docker run -d --name travelx-loadtest \
 ```
 
 - `env/configmap.env`는 [infra 레포의 `k8s/configmap.env`](https://github.com/vietnam-internship/infra/blob/main/k8s/configmap.env)와
-  `k8s/secret.env`를 합쳐서 로컬에 직접 만든다 (이 저장소엔 실제 값을 커밋하지 않음 —
-  `env/configmap.env.example` 참고).
-- `--cpus=0.5 --memory=768m`은 [infra 레포 `deployment.yaml`](https://github.com/vietnam-internship/infra/blob/main/k8s/deployment.yaml)의
-  `resources.limits`와 동일하다.
-- `DEV_AUTH_ENABLED=true`만 실제 prod 값(`false`)과 다르게 오버라이드한다 — 테스트 유저
-  20명을 매번 실제 Google OAuth로 만들 수 없어서, 이 값만 테스트 편의를 위해 켠다. 그 외
+  `k8s/secret.env`를 합쳐서 로컬에 직접 만든다 (`env/configmap.env.example` 참고, 실제
+  값은 커밋 안 함).
+- `--cpus=0.5 --memory=768m`은 실배포 `deployment.yaml`의 `resources.limits`와 동일하다.
+- `DEV_AUTH_ENABLED=true`만 실배포 값(`false`)과 다르게 오버라이드한다. 그 외
   `HIKARI_MAX_POOL_SIZE=8`, `TOMCAT_MAX_THREADS=600`, `VIRTUAL_THREADS_ENABLED=true` 등은
-  전부 실제 prod 값 그대로 사용한다.
+  전부 실배포 값 그대로 사용한다.
 
-### 2. 상태 확인
+리허설 상태 확인: `curl http://localhost:8090/actuator/health`
 
-```bash
-curl http://localhost:8090/actuator/health
-```
+리허설에서는 `BASE_URL=http://localhost:8090`을 쓰고, 아래 B 섹션의 안전 수칙(트래픽
+시간대, 되돌리기 등)은 적용할 필요 없다 — 실사용자가 없는 로컬 컨테이너이기 때문이다.
+
+## B. 실제 배포 환경에서 실행
+
+- 대상: [vietnam-internship/infra](https://github.com/vietnam-internship/infra)로 띄운 단일
+  k3s VM. `travelx-server`는 해당 VM의 nginx가 `https://api.knu80th.shop → localhost:8080`으로
+  리버스 프록시한다(hostPort 8080, 인증서 certbot 관리).
+- MySQL은 RDS가 아니라 **같은 클러스터의 자체 파드**(`mysql-data` PVC)다.
+- `BASE_URL=https://api.knu80th.shop`으로 아래 사전 준비/실행 단계를 그대로 쓴다.
+- **반드시 [안전 수칙](#안전-수칙--실배포-대상-필수) 체크리스트 순서대로 진행할 것**
+  (`DEV_AUTH_ENABLED` on → seed → k6 → off → cleanup).
 
 ---
 
@@ -100,14 +173,17 @@ curl http://localhost:8090/actuator/health
 ### 사전 준비
 
 ```bash
-BASE_URL=http://localhost:8090 ./scripts/seed.sh
+BASE_URL=https://api.knu80th.shop ./scripts/seed.sh
 ```
 
 - 지점 1개(정원 6명, timeSlotCapacity=6) — A/B0/B1이 각각 같은 날짜의 다른 시간대(10:00/10:30/11:00)를
-  써서 서로 슬롯 정원을 침범하지 않음. 여기에 분산용 슬롯 20개 추가, 통화 USD 재고는 100만으로 시드
-- 서로 다른 유저 20명의 dev-auth 토큰 발급 (같은 유저로 동시 요청하면
-  `CONCURRENT_PENDING_PAYMENT_LIMIT`에 걸려 결과가 오염되므로 반드시 유저를 분리한다)
-- `k6/tokens.json`, `k6/spread-slots.json`, `k6/hot-slot.json` 생성 (git에는 커밋 안 함)
+  써서 서로 슬롯 정원을 침범하지 않음. 여기에 분산용 슬롯 20개 추가, 통화 USD 재고는 100만으로 시드.
+  생성 직후 `active=false`로 비활성화해 실사용자 대상 지점 목록에서 숨김.
+- 시나리오별로 **겹치지 않는** 유저 토큰 66명 발급(A 20 / B0 6 / B1 20 / C 20) —
+  같은 유저를 여러 시나리오에서 재사용하면 `CONCURRENT_PENDING_PAYMENT_LIMIT`에 걸려
+  결과가 오염되므로 반드시 구간을 분리한다.
+- `k6/tokens.json`, `k6/token-counts.json`, `k6/spread-slots.json`, `k6/hot-slot.json` 생성
+  (git에는 커밋 안 함)
 
 ### 시나리오 A — 정합성 검증 (제일 먼저 실행됨)
 
@@ -130,31 +206,54 @@ BASE_URL=http://localhost:8090 ./scripts/seed.sh
 
 ```bash
 cd k6
-k6 run -e BASE_URL=http://localhost:8090 scenario.js --summary-export=../results/summary.json
+k6 run -e BASE_URL=https://api.knu80th.shop scenario.js --summary-export=../results/summary.json
 ```
 
-`branchId`/슬롯 날짜·시간/유저 토큰은 전부 `seed.sh`가 만든 `hot-slot.json` /
-`spread-slots.json` / `tokens.json`을 스크립트가 직접 읽으므로 별도 `-e` 플래그가 필요 없다.
+`branchId`/슬롯 날짜·시간/유저 토큰/구간 오프셋은 전부 `seed.sh`가 만든 json 파일을
+스크립트가 직접 읽으므로 별도 `-e` 플래그가 필요 없다.
 
 `k6/scenario.js`는 A(정합성, 0초) → B0(VU=6, 20초 뒤) → B1(VU=20, 40초 뒤) →
 C(VU=20, 60초 뒤) 순서로 `startTime`을 분리해뒀기 때문에 한 번 실행으로 네 시나리오가
 순차 진행된다. **A/B0/B1은 서로 다른 슬롯(같은 날짜, 다른 시간대)을 쓴다** — 같은 슬롯을
 재사용하면 앞 시나리오가 정원 6을 다 소진해버려서 뒤 시나리오가 처음부터
-"슬롯 꽉 참"으로만 나오기 때문이다.
+"슬롯 꽉 참"으로만 나오기 때문이다. **A/B0/B1/C는 서로 다른 유저 구간을 쓴다** — 같은
+유저를 재사용하면 앞 시나리오에서 성공한 유저가 `PENDING_PAYMENT`를 쥔 채 뒤 시나리오에서
+C304로 막혀 결과가 오염되기 때문이다.
 
-### 실행 중/후 관측
+### 실행 중/후 관측 (실배포 — kubectl 기준)
 
 ```bash
 # 실시간 리소스
-docker stats travelx-loadtest
+sudo KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl top pod -l app=travelx-server
 
 # CPU 쓰로틀링 여부
-docker exec travelx-loadtest cat /sys/fs/cgroup/cpu.stat
+sudo KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl exec deployment/travelx-server -- cat /sys/fs/cgroup/cpu.stat
 
-# 데드락 여부
-docker exec travelx-mysql mysql -uroot -p$DB_PASSWORD -e "SHOW ENGINE INNODB STATUS\G" \
+# 데드락 여부 (자체 MySQL 파드, RDS 아님)
+sudo KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl exec deployment/mysql -- \
+  mysql -uroot -p$DB_PASSWORD -e "SHOW ENGINE INNODB STATUS\G" \
   | grep -A 30 "LATEST DETECTED DEADLOCK"
 ```
+
+로컬 리허설(A 섹션)에서는 위 명령을 그대로 `docker stats travelx-loadtest` /
+`docker exec travelx-loadtest cat /sys/fs/cgroup/cpu.stat` / `docker exec travelx-mysql mysql ...`로
+바꿔 쓰면 된다.
+
+---
+
+## 클린업
+
+```bash
+BASE_URL=https://api.knu80th.shop ./scripts/cleanup.sh
+```
+
+- 테스트 지점의 USD 재고를 0으로 되돌린다(active=false는 seed.sh가 이미 처리).
+- 테스트 예약(`PENDING_PAYMENT`)은 결제 웹훅을 안 태웠으므로 서버의 기존
+  `ReservationExpirySweeper`가 5분 TTL 후 자동으로 `EXPIRED` 처리하며 슬롯/재고를 복원한다
+  — 별도 조치 불필요.
+- 지점/예약/유저 행 자체를 DB에서 완전히 지우고 싶다면 스크립트가 출력하는 SQL을
+  검토 후 직접 실행할 것(삭제 API가 없어 자동화하지 않았고, 실배포 DB에 대한 되돌릴 수
+  없는 작업이라 의도적으로 사람 손을 거치게 했다).
 
 ---
 
@@ -164,7 +263,7 @@ docker exec travelx-mysql mysql -uroot -p$DB_PASSWORD -e "SHOW ENGINE INNODB STA
 |---|---|
 | 정합성 | 정확히 6건 성공, 나머지는 4xx (500 없음) |
 | 데드락 | 0건 |
-| B0 p95 | 락 대기만 있는 상태에서 목표치(예: 200ms대) 근접 |
+| B0 p95 | 락 대기만 있는 상태에서 목표치(예: 200ms대) 근접 — 단, 실배포는 nginx+TLS 경유라 로컬 리허설보다 기본 RTT가 크므로 최초 실행은 관찰 기준으로 삼는다 |
 | B1 − C | 값이 크면 "락이 실제 병목"이라는 원래 결론을 지지, 작으면 "커넥션 풀이 더 큰 병목"이라는 새로운 발견 |
 
 ---

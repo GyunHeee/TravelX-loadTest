@@ -4,6 +4,7 @@ env/secret.env
 
 # seed.sh가 생성하는 토큰/슬롯 정보 — 매 실행마다 새로 생성되고, 유저 JWT를 담고 있어 커밋 금지
 k6/tokens.json
+k6/token-counts.json
 k6/spread-slots.json
 k6/hot-slot.json
 
