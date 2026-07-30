@@ -3,24 +3,45 @@
 TravelX(환전 예약 플랫폼) 백엔드의 슬롯 예약 동시성 설계를
 [vietnam-internship/server Discussion #13](https://github.com/vietnam-internship/server/discussions/13)에서
 비관적 락(방안 A)으로 제안했다. 이 저장소는 그 제안이 실제 배포 환경
-([vietnam-internship/infra](https://github.com/vietnam-internship/infra))에서도 유효한지
-k6로 직접 검증한 기록이다.
-
-**이번 라운드부터는 로컬 복제가 아니라 실제 배포된 단일 인스턴스를 대상으로 직접
-실행한다** (별도 staging 환경이 없어 사실상 유일한 실서버). 그만큼 안전장치가
-전제조건이므로, 실행 전 반드시 [안전 수칙](#안전-수칙--실배포-대상-필수)을 먼저 읽을 것.
+([vietnam-internship/infra](https://github.com/vietnam-internship/infra)로 띄운 단일 인스턴스,
+`https://api.knu80th.shop`)에서도 유효한지 k6로 직접 검증한 기록이다. 별도 staging 환경이
+없어 이 인스턴스가 사실상 유일한 실서버이고, **모든 실행은 처음부터 이 실서버를 직접
+대상으로 했다** — 로컬 복제 환경은 쓰지 않았다. 그만큼 안전장치가 전제조건이므로, 실행 전
+반드시 [안전 수칙](#안전-수칙-필수)을 먼저 읽을 것.
 
 ---
 
-## 핵심 질문
+## 무엇을 확인하려 했고, 무엇을 알아냈나 (요약)
 
-슬롯 정원(6명) 경합 상황에서, **락 자체가 병목인가 아니면 커넥션 풀
-(`HIKARI_MAX_POOL_SIZE=8`)이 먼저 병목이 되는가?**
+**원래 물음(discussion#13)**: 슬롯 정원(6명) 경합 상황에서, `BranchTimeSlot` 행의 비관적
+락 자체가 병목인가, 아니면 `HIKARI_MAX_POOL_SIZE=8`인 커넥션 풀이 먼저 병목이 되는가?
 
-기존 논의(#13)는 이 4개 지표에 임계치를 정의했다: 락 대기시간, p95/p99 응답지연,
-데드락 발생 여부, TPS. 여기에 인프라 스펙을 직접 확인하는 과정에서 **커넥션 풀 대기**와
-**CPU 쓰로틀링**을 추가 관측 대상으로 넣었다 — 둘 다 락보다 먼저 병목이 될 수 있는
-요인이기 때문이다.
+이 물음에 답하려고 A(정합성 검증)/B0(풀 이내+락 경합)/B1(풀 초과+락 경합)/C(풀 초과+무경합)
+4개 시나리오를 k6로 짜서 실제 서버에 대고 5차례 실행했다. 결과부터 말하면:
+
+- **정합성은 항상 통과했다** — 슬롯 정원 6명을 넘는 예약이 확정된 적은 한 번도 없다.
+- **최종 결론: 병목은 락이 아니라 커넥션 풀이다.** 락 경합이 전혀 없는 대조군(C)이 락 경합이
+  있는 시나리오(A)보다 오히려 `HIKARI_MAX_POOL_SIZE=8` 고갈로 인한 500 에러를 더 많이
+  겪었다 — 락이 요청을 순서대로 줄 세워서 동시 DB 커넥션 수요를 오히려 분산시키는 반면,
+  경합이 없는 시나리오는 모든 요청이 한꺼번에 DB로 몰려서 풀을 더 확실하게 고갈시켰기
+  때문이다 ([`docs/round5-findings.md`](docs/round5-findings.md)).
+- **가는 길에 실제 버그를 3개 찾아 고쳤다** — 이게 이 테스트가 존재하는 이유를 가장 잘
+  보여준다. 순차적인 수동 QA로는 절대 안 드러나고, 실제 동시 요청이 몰려야만 나타나는
+  문제들이었다:
+  1. **서버 버그**: `branch_time_slots` 테이블에 있어야 할 UNIQUE 제약이 실제 운영 DB엔
+     없는 스키마 드리프트 상태였다. 고동시성 상황에서 중복 행이 쌓이면서 500 에러를
+     대량으로 냈다 (`server` 레포 커밋 `ca4867f`로 수정됨, [`docs/round2-findings.md`](docs/round2-findings.md)).
+  2. **테스트 설계 버그**: 시나리오마다 겹치는 유저를 재사용해서, 한 시나리오에서 성공한
+     유저가 다음 시나리오에서 `CONCURRENT_PENDING_PAYMENT_LIMIT`에 걸려 결과가 오염됐다
+     ([`docs/round1-findings.md`](docs/round1-findings.md)). 라운드가 바뀌어도 같은 이메일을
+     재사용해서 라운드 간에도 같은 문제가 새는 것도 나중에 추가로 발견했다
+     ([`docs/round3-findings.md`](docs/round3-findings.md)).
+  3. **k6 스크립트 버그**: k6의 `__VU`가 시나리오마다 1부터 새로 시작한다고 잘못 가정하고
+     토큰 인덱스를 계산했다. 실제로는 테스트 전체에서 전역으로 유일한 번호라서, 일부
+     시나리오의 토큰 배열 인덱스가 범위를 벗어나 `undefined` 토큰(`Bearer undefined`)으로
+     요청이 나가 401이 대량으로 났다 ([`docs/round4-findings.md`](docs/round4-findings.md)).
+
+각 라운드의 세부 실행 로그·분석·스크린샷은 [라운드별 결과](#라운드별-결과)에 정리했다.
 
 ---
 
@@ -32,59 +53,48 @@ k6로 직접 검증한 기록이다.
    이게 먼저다 — 이게 깨지면 뒤의 성능 숫자는 의미가 없다.
 2. **병목 지점**: 정원 경합 상황에서 실제로 느려지는 지점이 (a) `BranchTimeSlot` 행의
    비관적 락인지, (b) `HIKARI_MAX_POOL_SIZE=8` 커넥션 풀인지, (c) 그 외 예상 못 한
-   지점(예: 락을 쥔 채로 실행되는 외부 API 호출)인지 구분한다 (`B1 − C` 비교).
+   지점인지 구분한다 (`B1 − C` 비교).
 3. **실배포 스펙에서도 유효한가**: discussion#13은 로컬 조건으로 설계를 제안했다. 실제
    [vietnam-internship/infra](https://github.com/vietnam-internship/infra) 스펙(단일 VM,
    단일 replica, HPA 없음, 자체 MySQL 파드)에서도 같은 결론이 나오는지 직접 대상으로 확인한다.
 4. **고동시성에서만 드러나는 버그 찾기**: 정상적인 순차 테스트/수동 QA로는 절대 안 드러나고,
-   실제 동시 요청이 몰려야만 나타나는 버그를 찾는 것 자체가 목적 중 하나다. 실제로 1차
-   실행에서 `branch_time_slots`의 스키마 드리프트(UNIQUE 제약 누락)로 인한 동시성 버그를
-   찾아냈고, 서버 팀이 곧바로 고쳤다 ([`docs/round2-findings.md`](docs/round2-findings.md)) —
-   이게 이 테스트가 존재하는 이유를 가장 잘 보여주는 사례다.
+   실제 동시 요청이 몰려야만 나타나는 버그를 찾는 것 자체가 목적 중 하나다.
 
 **성공 기준**은 "임계치 통과"가 아니라 "위 네 가지에 대해 명확한 답을 얻는 것"이다. 임계치가
 깨져도 왜 깨졌는지 설명할 수 있으면 그 자체로 유의미한 결과다.
 
 ---
 
-## 이번 라운드에서 바뀐 것
+## 테스트 대상 환경
 
-- **대상**: 로컬 Docker 복제 → [vietnam-internship/infra](https://github.com/vietnam-internship/infra)로
-  배포된 실제 단일 인스턴스. 별도 staging 클러스터/DB는 없다(서버 코드에
-  `application-staging.yml`이 있지만 실제로 배포되는 곳은 `SPRING_PROFILES_ACTIVE=prod` 하나뿐).
-- **유저 풀 오염 버그 수정**: 예전엔 A(VU=20)/B0(VU=6)/B1(VU=20)이 같은 20명의 토큰을
-  `(__VU-1) % 20`으로 재사용했다. A에서 성공한 6명은 결제 웹훅을 안 태워 `PENDING_PAYMENT`
-  예약을 쥔 채 남는데, 이 유저가 B0/B1에서 다시 뽑히면 락/풀 대기가 아니라
-  `CONCURRENT_PENDING_PAYMENT_LIMIT`(C304)로 막혀 **순수 락 대기 측정이 오염**된다. 게다가
-  어떤 토큰이 A에서 이길지는 레이스라 재현성도 없었다. → **시나리오별로 겹치지 않는 유저
-  구간**(총 66명: A 20 / B0 6 / B1 20 / C 20)을 쓰도록 `seed.sh`/`scenario.js`를 고쳤다.
-- **실사용자 노출 차단**: 테스트 지점을 생성 직후 `active=false`로 비활성화해 공개
-  `GET /branches` 목록에서 숨긴다(예약 생성은 `branchId`를 직접 지정하므로 영향 없음).
-- **클린업 스크립트 추가**(`scripts/cleanup.sh`): 실배포 DB에 테스트 데이터가 남으므로,
-  종료 후 되돌릴 수 있는 것(재고)은 자동으로 되돌리고, 나머지는 검토용 SQL만 출력한다.
-- **관측 명령**: `docker exec`/`docker stats` → `kubectl exec`/`kubectl top pod`
-  (infra의 [`redeploy.sh`](https://github.com/vietnam-internship/infra/blob/main/redeploy.sh) 관례에 맞춰
-  `sudo kubectl`, `KUBECONFIG=/etc/rancher/k3s/k3s.yaml` 사용).
+- [vietnam-internship/infra](https://github.com/vietnam-internship/infra)로 띄운 **단일 k3s
+  VM**. `travelx-server`는 이 VM의 nginx가 `https://api.knu80th.shop → localhost:8080`으로
+  리버스 프록시한다(hostPort 8080, 인증서 certbot 관리).
+- MySQL은 RDS 같은 관리형 DB가 아니라 **같은 클러스터의 자체 파드**(`mysql-data` PVC)다.
+- 단일 replica, HPA 없음 — 부하테스트 트래픽이 실사용자 트래픽과 완전히 같은
+  CPU(500m)/메모리(768Mi)/HikariCP 풀(8)을 공유한다.
+- `BASE_URL=https://api.knu80th.shop`으로 모든 스크립트를 실행한다.
 
 ---
 
-## 안전 수칙 (실배포 대상 — 필수)
+## 안전 수칙 (필수)
 
-실배포 인프라의 실제 특성(모두 [vietnam-internship/infra](https://github.com/vietnam-internship/infra) 확인):
-
-- **단일 VM, 단일 replica, HPA 없음** — 부하테스트 트래픽이 실사용자 트래픽과 완전히
-  같은 CPU(500m)/메모리(768Mi)/HikariCP 풀(8)을 공유한다. 테스트 시간 동안 실사용자
-  응답이 느려질 수 있다.
-- **MySQL도 자체 파드(PVC)** — RDS 같은 관리형 DB가 아니라 같은 클러스터의 파드다.
-  DB 부하도 실사용자와 그대로 공유된다.
+- **단일 VM, 단일 replica, HPA 없음** — 테스트 시간 동안 실사용자 응답이 느려질 수 있다.
+- **MySQL도 자체 파드** — DB 부하도 실사용자와 그대로 공유된다.
 - **`DEV_AUTH_ENABLED`는 prod configmap에 `false`로 고정, 명시적 경고 있음**
   (`k8s/configmap.env`: "운영에서 켜두면 인증 우회 엔드포인트가 그대로 열려버리므로
   절대 true로 바꾸지 말 것"). 테스트를 위해 이 값을 켜는 것은 **의도적인 예외**이지
-  기본값이 아니다 — 아래처럼 최소 시간만 켜고 즉시 되돌린다.
+  기본값이 아니다 — 최소 시간만 켜고 즉시 되돌린다.
 - **`travelx-server` Deployment는 `Recreate` 전략** (hostPort 8080을 쓰기 때문에
-  RollingUpdate 불가). 즉 `DEV_AUTH_ENABLED`를 켜고 끌 때마다 파드가 재기동되며
-  **매번 수십 초~최대 수 분(startupProbe `failureThreshold: 30 × periodSeconds: 5`)의
-  실다운타임**이 발생한다 — on/off 두 번이면 다운타임도 두 번이다.
+  RollingUpdate 불가). `DEV_AUTH_ENABLED`를 켜고 끌 때마다 파드가 재기동되며 **매번 수십
+  초~최대 수 분의 실다운타임**이 발생한다 — on/off 두 번이면 다운타임도 두 번이다.
+- **재시드 없이 재실행 금지**: k6를 한 번이라도 돌렸다면(중단됐더라도) 슬롯 정원/유저의
+  `PENDING_PAYMENT` 상태가 이미 소비돼 있다. 재시드 없이 재실행하면 재현이 아니라 오염된
+  결과가 나온다([`docs/round4-findings.md`](docs/round4-findings.md)에서 실제로 겪은 실수).
+- **문제가 생긴 순간의 로그는 몇 분 안에 확보해야 한다**: 로그 aggregator가 없는 MVP
+  구성이라, k6 실행이 끝나는 즉시 서버 로그부터 파일로 받아두지 않으면 컨테이너 로그
+  로테이션으로 영영 사라진다([`docs/round3-findings.md`](docs/round3-findings.md)에서 실제로
+  놓친 사례).
 
 ### 체크리스트
 
@@ -92,21 +102,23 @@ k6로 직접 검증한 기록이다.
 2. `DEV_AUTH_ENABLED`를 켠다 (VM에서 직접, infra 레포의 커밋된 `configmap.env`는 건드리지
    않고 배포 스펙만 일시적으로 오버라이드 — 되돌리기 쉽게):
    ```bash
-   sudo KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl set env deployment/travelx-server DEV_AUTH_ENABLED=true
-   sudo KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl rollout status deployment/travelx-server --timeout=180s
+   kubectl set env deployment/travelx-server DEV_AUTH_ENABLED=true
+   kubectl rollout status deployment/travelx-server --timeout=180s
    curl -sf https://api.knu80th.shop/actuator/health
    ```
-3. `scripts/seed.sh` 실행 → `k6 run` 실행 → 결과 확인.
-4. **테스트 결과와 무관하게 즉시** `DEV_AUTH_ENABLED`를 되돌린다:
+3. `scripts/seed.sh` 실행 → `k6 run` 실행(끝까지, 중단하지 말 것) → 결과 확인.
+4. k6가 끝나면 **바로** 서버 로그부터 파일로 받아둔다 (분석은 그다음에 해도 됨):
    ```bash
-   sudo KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl set env deployment/travelx-server DEV_AUTH_ENABLED=false
-   sudo KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl rollout status deployment/travelx-server --timeout=180s
+   kubectl logs -l app=travelx-server -c travelx-server --tail=1000 > /tmp/roundN-server.log
    ```
-5. `scripts/cleanup.sh`로 테스트 지점 재고 정리 (테스트 예약 자체는 서버의 기존
-   `ReservationExpirySweeper`가 5분 TTL로 자동 정리 — 결제 웹훅을 안 태우므로 전부
-   `PENDING_PAYMENT → EXPIRED` 경로를 탄다).
-6. 테스트 중 `kubectl top pod`와 실사용자向 에러율을 병행 관찰하다가, 이상 징후가 보이면
-   즉시 k6를 중단(`Ctrl+C`)하고 3~4번을 먼저 실행한다.
+5. **테스트 결과와 무관하게 즉시** `DEV_AUTH_ENABLED`를 되돌린다:
+   ```bash
+   kubectl set env deployment/travelx-server DEV_AUTH_ENABLED=false
+   kubectl rollout status deployment/travelx-server --timeout=180s
+   ```
+6. `scripts/cleanup.sh`로 테스트 지점 재고 정리.
+7. 테스트 중 `kubectl top pod`와 실사용자向 에러율을 병행 관찰하다가, 이상 징후가 보이면
+   즉시 k6를 중단(`Ctrl+C`)하고 4~5번을 먼저 실행한다.
 
 ---
 
@@ -114,11 +126,10 @@ k6로 직접 검증한 기록이다.
 
 ```
 .
-├── README.md              # 이 문서 — 설계 배경과 실행 방법
+├── README.md              # 이 문서 — 설계 배경, 목표/결과 요약, 실행 방법
 ├── docs/
-│   └── round1-findings.md # 라운드별 실행 기록 — 변경사항/결과/원인 분석/TODO
-├── env/
-│   └── configmap.env.example   # (선택) 로컬 리허설용 — infra 레포 값 목록, 값 자체는 포함 안 함
+│   ├── round1~5-findings.md   # 라운드별 실행 기록 — 변경사항/결과/원인 분석/TODO
+│   └── images/                 # 라운드별 k6 결과 스크린샷
 ├── scripts/
 │   ├── seed.sh             # 지점/재고/슬롯/테스트 유저 토큰(66명) 생성
 │   └── cleanup.sh          # 테스트 지점 재고 정리 + 행 삭제용 SQL 출력(수동 실행)
@@ -137,132 +148,81 @@ k6로 직접 검증한 기록이다.
 | p95 / p99 응답지연 | 전체 요청의 95/99번째 백분위 응답 시간 | k6 `http_req_duration` |
 | 데드락 발생 여부 | 락 순서 충돌로 인한 트랜잭션 강제 종료 | `SHOW ENGINE INNODB STATUS`의 LATEST DETECTED DEADLOCK |
 | TPS | 초당 처리 가능한 예약 요청 수 | k6 `http_reqs` |
-| 커넥션 풀 대기시간 | HikariCP에서 커넥션을 못 받아 대기한 시간 | HikariCP DEBUG 로그 |
+| 커넥션 풀 대기시간 | HikariCP에서 커넥션을 못 받아 대기한 시간 | HikariCP DEBUG 로그, `CannotCreateTransactionException` 발생 여부 |
 | CPU 쓰로틀링 | cgroup CPU 제한(500m)에 걸려 강제 대기한 시간 | `/sys/fs/cgroup/cpu.stat`의 `nr_throttled` |
 
 ---
 
-## A. (선택) 로컬 리허설 — 실배포 실행 전 먼저 검증 권장
+## 실행 방법
 
-실배포에 영향을 주지 않고 스크립트/시나리오 자체가 의도대로 도는지 먼저 확인하고
-싶다면, 동일 리소스 제약을 Docker로 복제해 리허설한다.
-
-```bash
-docker network create travelx-net
-
-docker run -d --name travelx-mysql \
-  --network travelx-net \
-  -e MYSQL_DATABASE=travelx \
-  -e MYSQL_USER=$DB_USERNAME \
-  -e MYSQL_PASSWORD=$DB_PASSWORD \
-  -e MYSQL_ROOT_PASSWORD=$DB_PASSWORD \
-  mysql:8.4
-
-docker run -d --name travelx-loadtest \
-  --network travelx-net \
-  --cpus=0.5 --memory=768m \
-  --env-file env/configmap.env \
-  -e DEV_AUTH_ENABLED=true \
-  -e JAVA_TOOL_OPTIONS="-Xlog:gc*:file=/app/logs/gc.log" \
-  -p 8090:8080 \
-  ghcr.io/vietnam-internship/server:latest
-```
-
-- `env/configmap.env`는 [infra 레포의 `k8s/configmap.env`](https://github.com/vietnam-internship/infra/blob/main/k8s/configmap.env)와
-  `k8s/secret.env`를 합쳐서 로컬에 직접 만든다 (`env/configmap.env.example` 참고, 실제
-  값은 커밋 안 함).
-- `--cpus=0.5 --memory=768m`은 실배포 `deployment.yaml`의 `resources.limits`와 동일하다.
-- `DEV_AUTH_ENABLED=true`만 실배포 값(`false`)과 다르게 오버라이드한다. 그 외
-  `HIKARI_MAX_POOL_SIZE=8`, `TOMCAT_MAX_THREADS=600`, `VIRTUAL_THREADS_ENABLED=true` 등은
-  전부 실배포 값 그대로 사용한다.
-
-리허설 상태 확인: `curl http://localhost:8090/actuator/health`
-
-리허설에서는 `BASE_URL=http://localhost:8090`을 쓰고, 아래 B 섹션의 안전 수칙(트래픽
-시간대, 되돌리기 등)은 적용할 필요 없다 — 실사용자가 없는 로컬 컨테이너이기 때문이다.
-
-## B. 실제 배포 환경에서 실행
-
-- 대상: [vietnam-internship/infra](https://github.com/vietnam-internship/infra)로 띄운 단일
-  k3s VM. `travelx-server`는 해당 VM의 nginx가 `https://api.knu80th.shop → localhost:8080`으로
-  리버스 프록시한다(hostPort 8080, 인증서 certbot 관리).
-- MySQL은 RDS가 아니라 **같은 클러스터의 자체 파드**(`mysql-data` PVC)다.
-- `BASE_URL=https://api.knu80th.shop`으로 아래 사전 준비/실행 단계를 그대로 쓴다.
-- **반드시 [안전 수칙](#안전-수칙--실배포-대상-필수) 체크리스트 순서대로 진행할 것**
-  (`DEV_AUTH_ENABLED` on → seed → k6 → off → cleanup).
-
----
-
-## 테스트 시나리오
-
-### 사전 준비
+### 1. 사전 준비 — 시드
 
 ```bash
 BASE_URL=https://api.knu80th.shop ./scripts/seed.sh
 ```
 
-- 지점 1개(정원 6명, timeSlotCapacity=6) — A/B0/B1이 각각 같은 날짜의 다른 시간대(10:00/10:30/11:00)를
-  써서 서로 슬롯 정원을 침범하지 않음. 여기에 분산용 슬롯 20개 추가, 통화 USD 재고는 100만으로 시드.
-  생성 직후 `active=false`로 비활성화해 실사용자 대상 지점 목록에서 숨김.
-- 시나리오별로 **겹치지 않는** 유저 토큰 66명 발급(A 20 / B0 6 / B1 20 / C 20) —
-  같은 유저를 여러 시나리오에서 재사용하면 `CONCURRENT_PENDING_PAYMENT_LIMIT`에 걸려
-  결과가 오염되므로 반드시 구간을 분리한다.
+- 지점 1개(정원 6명, `timeSlotCapacity=6`) — A/B0/B1이 각각 같은 날짜의 다른 시간대
+  (10:00/10:30/11:00)를 써서 서로 슬롯 정원을 침범하지 않음. 분산용 슬롯 20개(C용) 추가,
+  통화 USD 재고는 100만으로 시드. 생성 직후 `active=false`로 비활성화해 실사용자 대상
+  공개 지점 목록(`GET /branches`)에서 숨김(예약 생성은 `branchId`를 직접 지정하므로 영향 없음).
+- 시나리오별로 **겹치지 않는** 유저 토큰 66명 발급(A 20 / B0 6 / B1 20 / C 20). 같은 유저를
+  여러 시나리오에서 재사용하면 `CONCURRENT_PENDING_PAYMENT_LIMIT`에 걸려 결과가 오염되므로
+  구간을 분리한다. 이메일에는 실행마다 고유한 `RUN_ID`(타임스탬프)를 섞어서, 라운드가
+  바뀌어도 이전 라운드의 유저 상태(아직 안 풀린 `PENDING_PAYMENT` 등)와 섞이지 않게 한다.
 - `k6/tokens.json`, `k6/token-counts.json`, `k6/spread-slots.json`, `k6/hot-slot.json` 생성
-  (git에는 커밋 안 함)
+  (git에는 커밋 안 함, 매번 새로 생성됨).
 
-### 시나리오 A — 정합성 검증 (제일 먼저 실행됨)
-
-정원 6인 슬롯에 서로 다른 유저 20명이 동시에 `POST /reservations` →
-**정확히 6건만 성공**, 나머지는 정원초과 에러(500 아님)인지 확인한다.
-`k6/scenario.js`에서 항상 첫 번째(0초)로 실행되도록 고정해뒀다 — 이게 실패하면
-뒤이은 B0/B1/C의 성능 숫자는 의미가 없으므로, k6 실행 후 콘솔에서 A의 성공 건수부터
-확인한다.
-
-### 시나리오 매트릭스 — 락 vs 커넥션 풀 분리
+### 2. 시나리오 구성 — 락 vs 커넥션 풀 분리
 
 |                        | 풀 크기 이내(VU=6)      | 풀 초과(VU=20)                    |
 |------------------------|--------------------------|-----------------------------------|
 | **같은 슬롯**(경합 O) | B0 — 순수 락 대기        | B1 — 실제 배포 조건(락+풀 대기 합산) |
 | **다른 슬롯**(경합 X) | 대조군(즉시 응답 확인용) | C — 풀 대기만(락 없음)             |
 
-**`B1 − C ≈ 슬롯 락 자체로 인한 순수 지연`** — 이 차감이 이 테스트 설계의 핵심이다.
+`k6/scenario.js`는 A(정합성, 0초) → B0(20초 뒤) → B1(40초 뒤) → C(60초 뒤) 순서로
+`startTime`을 분리해서 한 번 실행으로 네 시나리오가 순차 진행된다. `B1 − C`가 크면 "락이
+실제 병목", 작으면 "커넥션 풀이 더 큰 병목"이라는 뜻 — 실제로는 후자로 나왔다(위 요약 참고).
 
-### 실행
+### 3. 실행
 
 ```bash
-cd k6
-k6 run -e BASE_URL=https://api.knu80th.shop scenario.js --summary-export=../results/summary.json
+k6 run -e BASE_URL=https://api.knu80th.shop k6/scenario.js \
+  --summary-export=results/summary.json 2>&1 | tee results/roundN-raw.log
 ```
 
-`branchId`/슬롯 날짜·시간/유저 토큰/구간 오프셋은 전부 `seed.sh`가 만든 json 파일을
-스크립트가 직접 읽으므로 별도 `-e` 플래그가 필요 없다.
+- `branchId`/슬롯 날짜·시간/유저 토큰/구간 오프셋은 전부 `seed.sh`가 만든 json 파일을
+  스크립트가 직접 읽으므로 별도 `-e` 플래그가 필요 없다.
+- `reserve()`가 매 요청마다 `RESULT scenario=... status=... code=...` 로그를 남긴다 —
+  `tee`로 파일에 받아두면 아래처럼 시나리오별 성공/실패 분포를 바로 집계할 수 있다:
+  ```bash
+  grep 'msg="RESULT' results/roundN-raw.log | \
+    sed -E 's/.*msg="RESULT scenario=([^ ]+) vu=([0-9]+) iter=([0-9]+) tokenIndex=([0-9]+) status=([0-9]+) code=([^"]*)".*/\1 \5 \6/' | \
+    sort | uniq -c
+  ```
+- **k6 콘솔에서 시나리오 A의 성공 건수부터 확인한다** — 정확히 6건이 아니면 뒤의 B0/B1/C
+  숫자는 의미가 없다.
+- **절대 중단(Ctrl+C)하지 말 것** — 중단하면 일부 시나리오만 실행된 채로 슬롯/유저 상태가
+  소비되고, 안전 수칙에 있듯 재시드 없이는 재실행도 못 한다.
 
-`k6/scenario.js`는 A(정합성, 0초) → B0(VU=6, 20초 뒤) → B1(VU=20, 40초 뒤) →
-C(VU=20, 60초 뒤) 순서로 `startTime`을 분리해뒀기 때문에 한 번 실행으로 네 시나리오가
-순차 진행된다. **A/B0/B1은 서로 다른 슬롯(같은 날짜, 다른 시간대)을 쓴다** — 같은 슬롯을
-재사용하면 앞 시나리오가 정원 6을 다 소진해버려서 뒤 시나리오가 처음부터
-"슬롯 꽉 참"으로만 나오기 때문이다. **A/B0/B1/C는 서로 다른 유저 구간을 쓴다** — 같은
-유저를 재사용하면 앞 시나리오에서 성공한 유저가 `PENDING_PAYMENT`를 쥔 채 뒤 시나리오에서
-C304로 막혀 결과가 오염되기 때문이다.
-
-### 실행 중/후 관측 (실배포 — kubectl 기준)
+### 4. 실행 중/후 관측 (kubectl 기준)
 
 ```bash
 # 실시간 리소스
-sudo KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl top pod -l app=travelx-server
+kubectl top pod -l app=travelx-server
 
 # CPU 쓰로틀링 여부
-sudo KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl exec deployment/travelx-server -- cat /sys/fs/cgroup/cpu.stat
+kubectl exec deployment/travelx-server -- cat /sys/fs/cgroup/cpu.stat
 
-# 데드락 여부 (자체 MySQL 파드, RDS 아님)
-sudo KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl exec deployment/mysql -- \
+# 데드락 여부
+kubectl exec deployment/mysql -- \
   mysql -uroot -p$DB_PASSWORD -e "SHOW ENGINE INNODB STATUS\G" \
   | grep -A 30 "LATEST DETECTED DEADLOCK"
-```
 
-로컬 리허설(A 섹션)에서는 위 명령을 그대로 `docker stats travelx-loadtest` /
-`docker exec travelx-loadtest cat /sys/fs/cgroup/cpu.stat` / `docker exec travelx-mysql mysql ...`로
-바꿔 쓰면 된다.
+# k6 종료 직후 바로 (분석은 나중에 해도 되니 일단 확보부터)
+kubectl logs -l app=travelx-server -c travelx-server --tail=1000 > /tmp/roundN-server.log
+# 500(Unhandled exception)의 실제 스택트레이스
+grep -A 30 "Unhandled exception" /tmp/roundN-server.log
+```
 
 ---
 
@@ -278,7 +238,8 @@ BASE_URL=https://api.knu80th.shop ./scripts/cleanup.sh
   — 별도 조치 불필요.
 - 지점/예약/유저 행 자체를 DB에서 완전히 지우고 싶다면 스크립트가 출력하는 SQL을
   검토 후 직접 실행할 것(삭제 API가 없어 자동화하지 않았고, 실배포 DB에 대한 되돌릴 수
-  없는 작업이라 의도적으로 사람 손을 거치게 했다).
+  없는 작업이라 의도적으로 사람 손을 거치게 했다). 여러 라운드를 한 번에 정리하려면
+  `WHERE branch_id IN (...)`에 각 라운드의 `branchId`를 모두 나열하면 된다.
 
 ---
 
@@ -288,38 +249,38 @@ BASE_URL=https://api.knu80th.shop ./scripts/cleanup.sh
 |---|---|
 | 정합성 | 정확히 6건 성공, 나머지는 4xx (500 없음) |
 | 데드락 | 0건 |
-| B0 p95 | 락 대기만 있는 상태에서 목표치(예: 200ms대) 근접 — 단, 실배포는 nginx+TLS 경유라 로컬 리허설보다 기본 RTT가 크므로 최초 실행은 관찰 기준으로 삼는다 |
-| B1 − C | 값이 크면 "락이 실제 병목"이라는 원래 결론을 지지, 작으면 "커넥션 풀이 더 큰 병목"이라는 새로운 발견 |
+| B0 p95 | 락 대기만 있는 상태에서 목표치(예: 200ms대) 근접 — 단, nginx+TLS를 거치는 실배포 특성상 첫 실행은 관찰 기준으로 삼는다 |
+| B1 − C | 값이 크면 "락이 실제 병목", 작으면 "커넥션 풀이 더 큰 병목" (실측 결과는 후자) |
 
 ---
 
-## 결과
+## 라운드별 결과
 
-라운드별 실행 기록(변경사항/결과/원인 분석/TODO)은 `docs/round*-findings.md`에 정리한다.
+각 라운드의 세부 실행 로그·원인 분석·다음 단계 TODO는 `docs/round*-findings.md`에 있다.
 
-- **1차 실행** ([`docs/round1-findings.md`](docs/round1-findings.md)): 정합성 기준(전체 66건 중
+- **1차** ([`docs/round1-findings.md`](docs/round1-findings.md)): 정합성 기준(전체 66건 중
   성공 3건뿐, 500 34건) 미충족 — 원인 미확인 상태로 로그 확인 후 재테스트 예정.
-- **2차 실행** ([`docs/round2-findings.md`](docs/round2-findings.md)): 1차의 500(34건) 원인 확인 —
+- **2차** ([`docs/round2-findings.md`](docs/round2-findings.md)): 1차의 500(34건) 원인 확인 —
   `branch_time_slots`의 UNIQUE 제약 누락(스키마 드리프트)으로 `ensureExists()`의 동시성 방어가
   깨져 있었던 것(`server` 레포 `ca4867f`로 수정, 재현 안 됨). 대신 기대 성공 건수(38건)보다 훨씬
   적은 18건만 성공 — 관리자 API로는 `PENDING_PAYMENT` 상태를 조회할 수 없어 사후 재구성 불가
   확인, `k6/scenario.js`에 시나리오별 결과 로그(`RESULT scenario=... status=... code=...`) 추가.
-- **3차 실행** ([`docs/round3-findings.md`](docs/round3-findings.md)): 정합성 계속 통과(A 정확히
+- **3차** ([`docs/round3-findings.md`](docs/round3-findings.md)): 정합성 계속 통과(A 정확히
   6/20). 결과 로그로 새 문제 2개 발견 — (1) `seed.sh`가 라운드마다 같은 이메일을 써서 이전
   라운드의 `PENDING_PAYMENT`가 남은 유저가 재사용되며 C304 오염 → `RUN_ID`로 라운드별 유저
   분리해 수정 완료. (2) B1/C에서 401(A001) 다수 발생 — 재배포 충돌은 타이밍상 기각, 로그
   aggregator가 없어 그 순간 로그가 유실돼 원인 미해결로 다음 라운드로 이월.
-- **4차 실행** ([`docs/round4-findings.md`](docs/round4-findings.md)): 401(A001)의 진짜 원인
+- **4차** ([`docs/round4-findings.md`](docs/round4-findings.md)): 401(A001)의 진짜 원인
   확정 — `k6`의 `__VU`는 시나리오마다 1부터 리셋되는 게 아니라 테스트 실행 전체에서 전역으로
   유일한 번호였다. `(__VU - 1)`로 토큰 인덱스를 계산하던 게 이 가정 위에 있어서 시나리오별
   토큰 배열 범위를 벗어났고, 범위 밖 접근이 `undefined` 토큰 → `Bearer undefined` → 401로
   이어졌던 것(서버 버그 아님). `exec.scenario.iterationInInstance`로 교체해 수정, 범위 이탈 시
   조용히 새지 않도록 `BUG` 로그도 추가. 이 과정에서 "중단된 실행 후 재시드 없이 재실행하면
   안 된다"는 것도 확인(슬롯/유저 상태가 이미 소비돼 있어 재현이 아니라 오염된 결과가 나옴).
-- **5차 실행** ([`docs/round5-findings.md`](docs/round5-findings.md)): `__VU` 픽스 후 처음
+- **5차** ([`docs/round5-findings.md`](docs/round5-findings.md)): `__VU` 픽스 후 처음
   끝까지 정상 완료(정합성 계속 통과, 32/38 성공). 실행 직후 곧바로 확보한 서버 로그로 잔여
   500의 정체를 확정 — `CannotCreateTransactionException`(HikariCP 커넥션 풀 고갈,
-  `HIKARI_MAX_POOL_SIZE=8` 초과 시 3초 타임아웃). **핵심 질문("락 vs 풀")에 대한 잠정 답**:
+  `HIKARI_MAX_POOL_SIZE=8` 초과 시 3초 타임아웃). **핵심 질문("락 vs 풀")에 대한 답**:
   락 경합이 없는 대조군(C)이 락 경합이 있는 A보다 오히려 이 에러를 더 많이 겪었다 — 락이
   요청을 순차적으로 줄 세워 동시 커넥션 수요를 분산시키는 반면, 무경합 시나리오는 다 같이
   DB로 몰려 풀을 더 확실하게 고갈시킨다. 즉 **병목은 락이 아니라 커넥션 풀**.
