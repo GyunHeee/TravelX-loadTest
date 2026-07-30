@@ -141,15 +141,19 @@ TravelX(환전 예약 플랫폼) 백엔드의 슬롯 예약 동시성 설계를
 
 ## 검증 대상 지표
 
-| 지표 | 정의 | 측정 방법 |
-|---|---|---|
-| 정합성(Correctness) | 슬롯 정원 초과 예약이 확정되지 않는가 | 성공 건수 카운트 (정확히 6건이어야 함) |
-| 락 대기시간 | `BranchTimeSlot` 행 락 획득까지 걸린 시간 | `SHOW ENGINE INNODB STATUS` / `sys.innodb_lock_waits` |
-| p95 / p99 응답지연 | 전체 요청의 95/99번째 백분위 응답 시간 | k6 `http_req_duration` |
-| 데드락 발생 여부 | 락 순서 충돌로 인한 트랜잭션 강제 종료 | `SHOW ENGINE INNODB STATUS`의 LATEST DETECTED DEADLOCK |
-| TPS | 초당 처리 가능한 예약 요청 수 | k6 `http_reqs` |
-| 커넥션 풀 대기시간 | HikariCP에서 커넥션을 못 받아 대기한 시간 | HikariCP DEBUG 로그, `CannotCreateTransactionException` 발생 여부 |
-| CPU 쓰로틀링 | cgroup CPU 제한(500m)에 걸려 강제 대기한 시간 | `/sys/fs/cgroup/cpu.stat`의 `nr_throttled` |
+가장 최근 정상 완료된 실행(5차, 2026-07-30, `branchId=24`)의 실측값을 같이 적는다. 자세한
+원본 수치는 [`docs/round5-findings.md`](docs/round5-findings.md)와
+[`docs/images/round5-total-results.png`](docs/images/round5-total-results.png) 참고.
+
+| 지표 | 정의 | 측정 방법 | 5차 실측값 |
+|---|---|---|---|
+| 정합성(Correctness) | 슬롯 정원 초과 예약이 확정되지 않는가 | 성공 건수 카운트 (정확히 6건이어야 함) | **통과** — A: 20건 중 정확히 6건 성공(`201`), 14건 정원초과(`409 C206`) |
+| 락 대기시간 | `BranchTimeSlot` 행 락 획득까지 걸린 시간 | `SHOW ENGINE INNODB STATUS` / `sys.innodb_lock_waits` | **직접 측정 안 함** (INNODB STATUS 미조회). 간접 추정: B0(VU=6, 풀 이내라 풀 대기 없음)의 응답시간이 곧 "락 대기 + Stripe 외부 호출 시간"이다 — avg 1.53s, p95 2.67s |
+| p95 / p99 응답지연 | 전체 요청의 95/99번째 백분위 응답 시간 | k6 `http_req_duration` | p95만 계산됨(p99는 옵션 미설정): B0 2.67s / B1 3.41s / C 5.55s |
+| 데드락 발생 여부 | 락 순서 충돌로 인한 트랜잭션 강제 종료 | `SHOW ENGINE INNODB STATUS`의 LATEST DETECTED DEADLOCK | **미확인** (조회 안 함). 서버 로그(`Unhandled exception`)에 데드락 관련 예외는 없었음 |
+| TPS | 초당 처리 가능한 예약 요청 수 | k6 `http_reqs` | 전체 66건/약 66초 ≈ **0.998 req/s** (k6 계산치) — 시나리오가 0/20/40/60초로 단계적으로 시작되므로 순간 최대 처리량은 아니고 전체 평균일 뿐 |
+| 커넥션 풀 대기시간 | HikariCP에서 커넥션을 못 받아 대기한 시간 | HikariCP DEBUG 로그, `CannotCreateTransactionException` 발생 여부 | 정확한 대기시간(ms)은 미측정(DEBUG 로그 미확인). 대신 **풀 고갈로 인한 `CannotCreateTransactionException` 8건 확인**(B1 2건, C 6건) — `HIKARI_CONNECTION_TIMEOUT=3000ms` 초과로 판단(`docs/round5-findings.md`) |
+| CPU 쓰로틀링 | cgroup CPU 제한(500m)에 걸려 강제 대기한 시간 | `/sys/fs/cgroup/cpu.stat`의 `nr_throttled` | **미확인** (조회 안 함) |
 
 ---
 
@@ -250,12 +254,14 @@ BRANCH_IDS="40 41 21 22 23 24" BASE_URL=https://api.knu80th.shop ./scripts/clean
 
 ## 성공/실패 판정 기준
 
-| 항목 | 통과 기준 |
-|---|---|
-| 정합성 | 정확히 6건 성공, 나머지는 4xx (500 없음) |
-| 데드락 | 0건 |
-| B0 p95 | 락 대기만 있는 상태에서 목표치(예: 200ms대) 근접 — 단, nginx+TLS를 거치는 실배포 특성상 첫 실행은 관찰 기준으로 삼는다 |
-| B1 − C | 값이 크면 "락이 실제 병목", 작으면 "커넥션 풀이 더 큰 병목" (실측 결과는 후자) |
+가장 최근 정상 완료된 실행(5차, 2026-07-30) 기준.
+
+| 항목 | 통과 기준 | 5차 결과 |
+|---|---|---|
+| 정합성 | 정확히 6건 성공, 나머지는 4xx (500 없음) | ✅ **통과** — A: 6건 성공(`201`) + 14건 정원초과(`409 C206`), 500 없음 |
+| 데드락 | 0건 | ⚠️ **미확인** — `SHOW ENGINE INNODB STATUS` 조회를 안 해서 판정 불가. 다음 라운드 TODO |
+| B0 p95 | 락 대기만 있는 상태에서 목표치(예: 200ms대) 근접 | ❌ **2.67s로 목표치 크게 초과**. 다만 이건 순수 락 대기가 아니라, `createReservation()`이 락을 잡은 채로 같은 트랜잭션 안에서 Stripe PaymentIntent 생성(외부 API 호출)까지 순차 실행하는 구조 때문일 가능성이 높다 — 서버 레포 쪽 코드 확인 필요(아직 안 함) |
+| B1 − C | 값이 크면 "락이 실제 병목", 작으면 "커넥션 풀이 더 큰 병목" | avg 기준 2.82s − 3.41s = **−0.59s**, p95 기준 3.41s − 5.55s = **−2.14s** — 둘 다 음수, 즉 락으로 인한 추가 지연은 관측되지 않았다. C가 오히려 더 높은 건 C의 500(6건, 각각 `HIKARI_CONNECTION_TIMEOUT` 3초를 다 기다리다 실패)이 평균/p95를 끌어올렸기 때문. **결론: 병목은 락이 아니라 커넥션 풀** |
 
 ---
 
