@@ -92,6 +92,8 @@ k6로 직접 검증한 기록이다.
 ```
 .
 ├── README.md              # 이 문서 — 설계 배경과 실행 방법
+├── docs/
+│   └── round1-findings.md # 라운드별 실행 기록 — 변경사항/결과/원인 분석/TODO
 ├── env/
 │   └── configmap.env.example   # (선택) 로컬 리허설용 — infra 레포 값 목록, 값 자체는 포함 안 함
 ├── scripts/
@@ -270,4 +272,7 @@ BASE_URL=https://api.knu80th.shop ./scripts/cleanup.sh
 
 ## 결과
 
-_실행 후 `results/`에 요약을 채우고, 이 섹션에 표/그래프로 정리 예정._
+라운드별 실행 기록(변경사항/결과/원인 분석/TODO)은 [`docs/round1-findings.md`](docs/round1-findings.md)에 정리한다.
+
+- **1차 실행** ([`docs/round1-findings.md`](docs/round1-findings.md)): 정합성 기준(전체 66건 중
+  성공 3건뿐, 500 34건) 미충족 — 원인 미확인 상태로 로그 확인 후 재테스트 예정.
