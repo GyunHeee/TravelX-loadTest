@@ -309,3 +309,10 @@ BASE_URL=https://api.knu80th.shop ./scripts/cleanup.sh
   라운드의 `PENDING_PAYMENT`가 남은 유저가 재사용되며 C304 오염 → `RUN_ID`로 라운드별 유저
   분리해 수정 완료. (2) B1/C에서 401(A001) 다수 발생 — 재배포 충돌은 타이밍상 기각, 로그
   aggregator가 없어 그 순간 로그가 유실돼 원인 미해결로 다음 라운드로 이월.
+- **4차 실행** ([`docs/round4-findings.md`](docs/round4-findings.md)): 401(A001)의 진짜 원인
+  확정 — `k6`의 `__VU`는 시나리오마다 1부터 리셋되는 게 아니라 테스트 실행 전체에서 전역으로
+  유일한 번호였다. `(__VU - 1)`로 토큰 인덱스를 계산하던 게 이 가정 위에 있어서 시나리오별
+  토큰 배열 범위를 벗어났고, 범위 밖 접근이 `undefined` 토큰 → `Bearer undefined` → 401로
+  이어졌던 것(서버 버그 아님). `exec.scenario.iterationInInstance`로 교체해 수정, 범위 이탈 시
+  조용히 새지 않도록 `BUG` 로그도 추가. 이 과정에서 "중단된 실행 후 재시드 없이 재실행하면
+  안 된다"는 것도 확인(슬롯/유저 상태가 이미 소비돼 있어 재현이 아니라 오염된 결과가 나옴).

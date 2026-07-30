@@ -95,12 +95,22 @@ export const options = {
 
 export function reserve() {
   const scenarioName = exec.scenario.name;
-  const tokenIndex = TOKEN_OFFSET_BY_SCENARIO[scenarioName] + (__VU - 1);
+  // __VU는 시나리오마다 1부터 다시 시작하는 게 아니라 이 테스트 실행 전체에서 유일한
+  // 전역 번호다(예: b0_pool_safe_contended가 VU=6개뿐인데도 실제 __VU 값은 24 같은 식으로
+  // 찍힘). __VU로 오프셋을 계산하면 시나리오별 토큰 범위를 벗어나 tokens.json 배열 밖을
+  // 가리키게 되고, 그 결과 token이 undefined가 되어 "Bearer undefined"로 요청 → 401만
+  // 잔뜩 나는 버그가 있었다(3~4차 라운드). exec.scenario.iterationInInstance는 "이
+  // 시나리오 안에서 몇 번째 이터레이션인가"를 0부터 세므로, 시나리오 내 순번이 정확히 필요하다.
+  const iterationIndex = exec.scenario.iterationInInstance;
+  const tokenIndex = TOKEN_OFFSET_BY_SCENARIO[scenarioName] + iterationIndex;
   const token = TOKENS[tokenIndex];
+  if (token === undefined) {
+    console.log(`BUG scenario=${scenarioName} vu=${__VU} iter=${iterationIndex} tokenIndex=${tokenIndex} out of range (tokens.length=${TOKENS.length})`);
+  }
 
   const slot =
     scenarioName === 'c_pool_exceed_spread'
-      ? SPREAD_SLOTS[(__VU - 1) % SPREAD_SLOTS.length]
+      ? SPREAD_SLOTS[iterationIndex % SPREAD_SLOTS.length]
       : SLOT_BY_SCENARIO[scenarioName];
 
   const res = http.post(
@@ -131,5 +141,5 @@ export function reserve() {
       errorCode = 'unparseable-body';
     }
   }
-  console.log(`RESULT scenario=${scenarioName} vu=${__VU} status=${res.status} code=${errorCode}`);
+  console.log(`RESULT scenario=${scenarioName} vu=${__VU} iter=${iterationIndex} tokenIndex=${tokenIndex} status=${res.status} code=${errorCode}`);
 }
