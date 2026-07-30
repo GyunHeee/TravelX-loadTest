@@ -45,11 +45,11 @@ echo "-------------------------------------------------------------------"
 echo "[선택] 지점/예약/유저 행 자체를 DB에서 완전히 지우려면 (되돌릴 수 없음, 검토 후 직접 실행):"
 echo ""
 cat <<SQL
--- FK 순서 주의: reservation → branch_time_slot/branch_currency_rate/branch/users 순으로 지운다.
-DELETE FROM reservation WHERE branch_id = $BRANCH_ID;
-DELETE FROM branch_time_slot WHERE branch_id = $BRANCH_ID;
-DELETE FROM branch_currency_rate WHERE branch_id = $BRANCH_ID;
-DELETE FROM branch WHERE id = $BRANCH_ID;
+-- FK 순서 주의: reservations → branch_time_slots/branch_currency_rates/branches/users 순으로 지운다.
+DELETE FROM reservations WHERE branch_id = $BRANCH_ID;
+DELETE FROM branch_time_slots WHERE branch_id = $BRANCH_ID;
+DELETE FROM branch_currency_rates WHERE branch_id = $BRANCH_ID;
+DELETE FROM branches WHERE id = $BRANCH_ID;
 DELETE FROM users WHERE email LIKE 'loadtest-%@travelx.dev';
 SQL
 echo "-------------------------------------------------------------------"
