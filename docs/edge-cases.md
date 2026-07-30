@@ -63,11 +63,42 @@ k6 run -e BASE_URL=https://api.knu80th.shop k6/edge-case-cancel-race.js
 
 ---
 
+### 실행 결과 — 버그 확정 (2026-07-30, `branchId=25`, `reservationId=102`)
+
+```
+CANCEL_RESULT: 204(성공) 5건, 409 C207(이미 취소됨) 5건 — 10건 중 5건이나 "성공" 처리됨
+VERIFY: baselineStock=10000 expectedAfterOneCancel=10000 finalStock=10400
+VERIFY_RESULT: BUG_CONFIRMED — finalStock(10400) > baseline(10000), 약 4회 이중 복원됨
+```
+
+10개의 동시 `DELETE /reservations/{id}` 요청 중 **5건이 각각 `204 No Content`(정상 취소
+처리)를 받았다** — 하나의 예약을 5번 "성공적으로" 취소한 셈이다. 재고는 예약 생성으로
+9900까지 내려간 뒤 **10400으로 끝났다**: 정상적인 복원 1회(9900→10000) 위에 **4회의
+초과 복원**(각 +100)이 더해진 값과 정확히 일치한다 — 즉 실제로는 5번의 `restoreStock()`
+호출이 전부 실행됐다는 뜻이다(성공 응답 5건과 정확히 일치).
+
+**의미**: 이건 discussion#13이 막으려던 "오버부킹"과 **거울처럼 반대되는 방향의 정합성
+버그**다 — 정원 초과 예약을 막는 락은 잘 작동하지만(README 목표 1번, 계속 통과), 취소 경로엔
+같은 보호가 전혀 없어서 **재고/슬롯이 실제보다 많이 남아있는 것처럼 부풀려질 수 있다.** 이러면
+나중에 진짜로 재고가 없는데도 "있다"고 잘못 판단해 예약을 더 받아버리는 2차 문제로 이어질 수
+있다. 이번 테스트는 `BranchCurrencyRate`(재고) 복원만 직접 측정했지만, `BranchTimeSlot`
+(슬롯 `remaining`)의 `restoreTimeSlot()`도 정확히 같은 코드 패턴(락 없는 상태 체크 후
+무조건 복원)이라 동일한 버그가 있을 가능성이 매우 높다 — 다음에 확인.
+
+---
+
 ### 남은 것
 
-- [ ] `k6/edge-case-cancel-race.js` 실제 실행 → `VERIFY_RESULT` 로그로 버그 재현 여부 확인
+- [x] `k6/edge-case-cancel-race.js` 실제 실행 → **버그 재현 확인** (위 결과 참고)
+- [ ] `BranchTimeSlot.remaining`도 같이 이중 복원되는지 확인(DB 직접 조회 필요 — API로는
+      정확한 잔여 슬롯 수를 노출하지 않음)
 - [ ] 관리자 재고 변경 vs 고객 예약(lost update) 검증 스크립트도 작성
       (`k6/edge-case-admin-inventory-race.js` 예정) — 재고를 알려진 값으로 시드 → 서로 다른
       슬롯에 예약 N건(재고만 차감, 슬롯 경합 없음) + 관리자가 같은 "오래된" 값으로 재고를
       계속 덮어쓰는 요청을 동시에 쏨 → `기대 재고(baseline − amount×성공건수)`와 실제 재고 비교
-- [ ] (발견되면) 서버 레포 쪽에 버그로 보고할지 여부 결정 — 이 레포 스코프 밖이라 수정은 안 함
+- [ ] 서버 레포 쪽에 버그로 보고할지 여부 결정 — 이 레포 스코프 밖이라 수정은 안 함. 제안:
+      `cancelReservation()`/`rejectByBranch()`/`redeem()`에서도 `Reservation` 조회를
+      `findById` 대신 `PESSIMISTIC_WRITE` 락으로 바꾸거나, `@Version`(낙관적 락) 도입
+      (server 레포 `docs/discussion-reservation-cancel-expire-race.md`의 "방안 2"와 동일한
+      해법이 여기(동시 취소)에도 그대로 적용됨)
+- [ ] 정리 필요: 이번 테스트로 생성된 `branchId=25` 정리 (`cleanup.sh`에 추가)
