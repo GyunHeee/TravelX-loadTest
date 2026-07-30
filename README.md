@@ -276,7 +276,8 @@ BASE_URL=https://api.knu80th.shop ./scripts/cleanup.sh
 
 - **1차 실행** ([`docs/round1-findings.md`](docs/round1-findings.md)): 정합성 기준(전체 66건 중
   성공 3건뿐, 500 34건) 미충족 — 원인 미확인 상태로 로그 확인 후 재테스트 예정.
-- **2차 실행** ([`docs/round2-findings.md`](docs/round2-findings.md)): 1차의 500(34건)은 재현
-  안 됨(원인 불명인 채로 사라짐). 대신 기대 성공 건수(38건)보다 훨씬 적은 18건만 성공 — 관리자
-  API로는 `PENDING_PAYMENT` 상태를 조회할 수 없어 사후 재구성 불가 확인, `k6/scenario.js`에
-  시나리오별 결과 로그(`RESULT scenario=... status=... code=...`) 추가.
+- **2차 실행** ([`docs/round2-findings.md`](docs/round2-findings.md)): 1차의 500(34건) 원인 확인 —
+  `branch_time_slots`의 UNIQUE 제약 누락(스키마 드리프트)으로 `ensureExists()`의 동시성 방어가
+  깨져 있었던 것(`server` 레포 `ca4867f`로 수정, 재현 안 됨). 대신 기대 성공 건수(38건)보다 훨씬
+  적은 18건만 성공 — 관리자 API로는 `PENDING_PAYMENT` 상태를 조회할 수 없어 사후 재구성 불가
+  확인, `k6/scenario.js`에 시나리오별 결과 로그(`RESULT scenario=... status=... code=...`) 추가.
