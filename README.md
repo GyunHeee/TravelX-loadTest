@@ -316,3 +316,10 @@ BASE_URL=https://api.knu80th.shop ./scripts/cleanup.sh
   이어졌던 것(서버 버그 아님). `exec.scenario.iterationInInstance`로 교체해 수정, 범위 이탈 시
   조용히 새지 않도록 `BUG` 로그도 추가. 이 과정에서 "중단된 실행 후 재시드 없이 재실행하면
   안 된다"는 것도 확인(슬롯/유저 상태가 이미 소비돼 있어 재현이 아니라 오염된 결과가 나옴).
+- **5차 실행** ([`docs/round5-findings.md`](docs/round5-findings.md)): `__VU` 픽스 후 처음
+  끝까지 정상 완료(정합성 계속 통과, 32/38 성공). 실행 직후 곧바로 확보한 서버 로그로 잔여
+  500의 정체를 확정 — `CannotCreateTransactionException`(HikariCP 커넥션 풀 고갈,
+  `HIKARI_MAX_POOL_SIZE=8` 초과 시 3초 타임아웃). **핵심 질문("락 vs 풀")에 대한 잠정 답**:
+  락 경합이 없는 대조군(C)이 락 경합이 있는 A보다 오히려 이 에러를 더 많이 겪었다 — 락이
+  요청을 순차적으로 줄 세워 동시 커넥션 수요를 분산시키는 반면, 무경합 시나리오는 다 같이
+  DB로 몰려 풀을 더 확실하게 고갈시킨다. 즉 **병목은 락이 아니라 커넥션 풀**.
