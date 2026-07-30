@@ -26,10 +26,17 @@ TOTAL_COUNT=$((A_COUNT + B0_COUNT + B1_COUNT + C_COUNT))
 
 K6_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../k6" && pwd)"
 
+# 라운드마다 고유한 유저를 새로 만들기 위한 구분자. 이메일이 이전 라운드와 같으면
+# DevAuthController가 기존 유저를 그대로 재사용하는데, 그 유저가 이전 라운드에서 만든
+# 예약이 아직 PENDING_PAYMENT로 남아있으면(5분 TTL 전이거나 뭔가 안 풀렸으면) 이번 라운드에서
+# CONCURRENT_PENDING_PAYMENT_LIMIT(C304)에 바로 걸려 락/풀 대기 측정이 오염된다.
+RUN_ID="${RUN_ID:-$(date +%s)}"
+echo "== 0. 이번 라운드 RUN_ID=$RUN_ID (유저 이메일에 반영, 라운드 간 상태 오염 방지) =="
+
 echo "== 1. admin 토큰 발급 =="
 ADMIN_TOKEN=$(curl -sf -X POST "$BASE_URL/dev/auth/token" \
   -H "Content-Type: application/json" \
-  -d '{"email":"loadtest-admin@travelx.dev","role":"ADMIN"}' | jq -r .accessToken)
+  -d "{\"email\":\"loadtest-admin-$RUN_ID@travelx.dev\",\"role\":\"ADMIN\"}" | jq -r .accessToken)
 
 echo "== 2. 지점 생성 (timeSlotCapacity=6) =="
 BRANCH_ID=$(curl -sf -X POST "$BASE_URL/admin/branches" \
@@ -90,7 +97,7 @@ TOKENS_JSON="["
 for i in $(seq 1 "$TOTAL_COUNT"); do
   TOKEN=$(curl -sf -X POST "$BASE_URL/dev/auth/token" \
     -H "Content-Type: application/json" \
-    -d "{\"email\":\"loadtest-user-$i@travelx.dev\"}" | jq -r .accessToken)
+    -d "{\"email\":\"loadtest-user-$i-$RUN_ID@travelx.dev\"}" | jq -r .accessToken)
   TOKENS_JSON+="\"$TOKEN\""
   [ "$i" -lt "$TOTAL_COUNT" ] && TOKENS_JSON+=","
 done

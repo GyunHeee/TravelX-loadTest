@@ -304,3 +304,8 @@ BASE_URL=https://api.knu80th.shop ./scripts/cleanup.sh
   깨져 있었던 것(`server` 레포 `ca4867f`로 수정, 재현 안 됨). 대신 기대 성공 건수(38건)보다 훨씬
   적은 18건만 성공 — 관리자 API로는 `PENDING_PAYMENT` 상태를 조회할 수 없어 사후 재구성 불가
   확인, `k6/scenario.js`에 시나리오별 결과 로그(`RESULT scenario=... status=... code=...`) 추가.
+- **3차 실행** ([`docs/round3-findings.md`](docs/round3-findings.md)): 정합성 계속 통과(A 정확히
+  6/20). 결과 로그로 새 문제 2개 발견 — (1) `seed.sh`가 라운드마다 같은 이메일을 써서 이전
+  라운드의 `PENDING_PAYMENT`가 남은 유저가 재사용되며 C304 오염 → `RUN_ID`로 라운드별 유저
+  분리해 수정 완료. (2) B1/C에서 401(A001) 다수 발생 — 재배포 충돌은 타이밍상 기각, 로그
+  aggregator가 없어 그 순간 로그가 유실돼 원인 미해결로 다음 라운드로 이월.
