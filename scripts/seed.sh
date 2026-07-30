@@ -67,7 +67,7 @@ jq -n --arg branchId "$BRANCH_ID" --arg date "$HOT_DATE" \
   > "$K6_DIR/hot-slot.json"
 echo "hot slots on $HOT_DATE: A=10:00 B0=10:30 B1=11:00"
 
-echo "== 6. 분산 슬롯(C용) $C_COUNT개 — 서로 다른 날짜/시간이라 경합이 안 생김 =="
+echo "== 6. 분산 슬롯(C용) ${C_COUNT}개 — 서로 다른 날짜/시간이라 경합이 안 생김 =="
 SPREAD_JSON="["
 for i in $(seq 0 $((C_COUNT - 1))); do
   DAY_OFFSET=$((2 + i / 4))          # 30분 슬롯 4개씩 하루에 배분
@@ -82,7 +82,7 @@ done
 SPREAD_JSON+="]"
 echo "$SPREAD_JSON" | jq '.' > "$K6_DIR/spread-slots.json"
 
-echo "== 7. 테스트 유저 $TOTAL_COUNT명 토큰 발급 =="
+echo "== 7. 테스트 유저 ${TOTAL_COUNT}명 토큰 발급 =="
 echo "==    순서 고정: A[0:$A_COUNT) B0[$A_COUNT:$((A_COUNT + B0_COUNT))) "
 echo "==    B1[$((A_COUNT + B0_COUNT)):$((A_COUNT + B0_COUNT + B1_COUNT))) C[$((A_COUNT + B0_COUNT + B1_COUNT)):$TOTAL_COUNT)"
 echo "==    scenario.js가 이 순서를 그대로 슬라이스해서 쓰므로 순서를 바꾸면 안 된다."
@@ -103,7 +103,7 @@ jq -n --argjson a "$A_COUNT" --argjson b0 "$B0_COUNT" --argjson b1 "$B1_COUNT" -
   '{a: $a, b0: $b0, b1: $b1, c: $c}' > "$K6_DIR/token-counts.json"
 
 echo ""
-echo "완료 (총 $TOTAL_COUNT명 유저, branchId=$BRANCH_ID, 비활성화 처리됨)."
+echo "완료 (총 ${TOTAL_COUNT}명 유저, branchId=$BRANCH_ID, 비활성화 처리됨)."
 echo "k6 실행 예시 (branchId/슬롯/토큰/카운트는 전부 위에서 만든 json에서 자동으로 읽음):"
 echo "  k6 run -e BASE_URL=$BASE_URL k6/scenario.js --summary-export=results/summary.json"
 echo ""
