@@ -116,7 +116,7 @@ TravelX(환전 예약 플랫폼) 백엔드의 슬롯 예약 동시성 설계를
    kubectl set env deployment/travelx-server DEV_AUTH_ENABLED=false
    kubectl rollout status deployment/travelx-server --timeout=180s
    ```
-6. `scripts/cleanup.sh`로 테스트 지점 재고 정리.
+6. `scripts/cleanup.sh`로 테스트 지점 재고/행 정리 (VM에서, [클린업](#클린업) 참고).
 7. 테스트 중 `kubectl top pod`와 실사용자向 에러율을 병행 관찰하다가, 이상 징후가 보이면
    즉시 k6를 중단(`Ctrl+C`)하고 4~5번을 먼저 실행한다.
 
@@ -132,7 +132,7 @@ TravelX(환전 예약 플랫폼) 백엔드의 슬롯 예약 동시성 설계를
 │   └── images/                 # 라운드별 k6 결과 스크린샷
 ├── scripts/
 │   ├── seed.sh             # 지점/재고/슬롯/테스트 유저 토큰(66명) 생성
-│   └── cleanup.sh          # 테스트 지점 재고 정리 + 행 삭제용 SQL 출력(수동 실행)
+│   └── cleanup.sh          # 테스트 지점 재고 정리 + kubectl exec로 실제 행 삭제(확인 프롬프트)
 └── k6/
     └── scenario.js         # 부하테스트 시나리오 (A/B0/B1/C)
 ```
@@ -228,18 +228,23 @@ grep -A 30 "Unhandled exception" /tmp/roundN-server.log
 
 ## 클린업
 
+**VM에서 실행할 것** — 행 삭제에 `kubectl exec`로 mysql 파드 접근이 필요하다.
+
 ```bash
+# 이번 라운드(k6/hot-slot.json)의 branchId만 정리
 BASE_URL=https://api.knu80th.shop ./scripts/cleanup.sh
+
+# 여러 라운드를 한 번에 정리하려면 BRANCH_IDS에 공백으로 나열
+BRANCH_IDS="40 41 21 22 23 24" BASE_URL=https://api.knu80th.shop ./scripts/cleanup.sh
 ```
 
-- 테스트 지점의 USD 재고를 0으로 되돌린다(active=false는 seed.sh가 이미 처리).
-- 테스트 예약(`PENDING_PAYMENT`)은 결제 웹훅을 안 태웠으므로 서버의 기존
-  `ReservationExpirySweeper`가 5분 TTL 후 자동으로 `EXPIRED` 처리하며 슬롯/재고를 복원한다
-  — 별도 조치 불필요.
-- 지점/예약/유저 행 자체를 DB에서 완전히 지우고 싶다면 스크립트가 출력하는 SQL을
-  검토 후 직접 실행할 것(삭제 API가 없어 자동화하지 않았고, 실배포 DB에 대한 되돌릴 수
-  없는 작업이라 의도적으로 사람 손을 거치게 했다). 여러 라운드를 한 번에 정리하려면
-  `WHERE branch_id IN (...)`에 각 라운드의 `branchId`를 모두 나열하면 된다.
+- 테스트 지점(들)의 USD 재고를 API로 0으로 되돌린다(active=false는 seed.sh가 이미 처리).
+- 지점/예약/슬롯/재고 행과 `loadtest-%@travelx.dev` 유저를 **`kubectl exec`로 실제로
+  삭제**한다 — 되돌릴 수 없는 작업이라 실행 전 SQL과 대상 `branch_id`를 그대로 보여주고
+  `y` 확인을 받는다(비대화형으로 쓰려면 `CONFIRM=yes` 지정). `DB_USERNAME`/`DB_PASSWORD`
+  환경변수가 VM 셸에 미리 있어야 한다.
+- 테스트 예약이 아직 `PENDING_PAYMENT`인 채로 삭제돼도 문제없다 — 서버의 기존
+  `ReservationExpirySweeper`는 그냥 못 찾는 행을 건너뛸 뿐이다.
 
 ---
 
