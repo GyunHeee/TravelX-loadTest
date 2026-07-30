@@ -119,4 +119,17 @@ export function reserve() {
     'not a 500': (r) => r.status !== 500,
     'not a connection timeout': (r) => r.status !== 0,
   });
+
+  // 서버 상태(PENDING_PAYMENT 5분 TTL로 재고/예약 상태가 계속 바뀜)에 의존하지 않고, 시나리오별
+  // 성공/실패 분포를 그 자리에서 바로 확인하기 위한 로그. 실패 응답의 code 필드(BusinessErrorCode)도
+  // 같이 찍어서 "정원초과라 정상 거절"인지 "처리 안 된 예외"인지 바로 구분한다.
+  let errorCode = '';
+  if (res.status !== 200 && res.status !== 201) {
+    try {
+      errorCode = JSON.parse(res.body).code || '';
+    } catch (e) {
+      errorCode = 'unparseable-body';
+    }
+  }
+  console.log(`RESULT scenario=${scenarioName} vu=${__VU} status=${res.status} code=${errorCode}`);
 }

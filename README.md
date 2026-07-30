@@ -272,7 +272,11 @@ BASE_URL=https://api.knu80th.shop ./scripts/cleanup.sh
 
 ## 결과
 
-라운드별 실행 기록(변경사항/결과/원인 분석/TODO)은 [`docs/round1-findings.md`](docs/round1-findings.md)에 정리한다.
+라운드별 실행 기록(변경사항/결과/원인 분석/TODO)은 `docs/round*-findings.md`에 정리한다.
 
 - **1차 실행** ([`docs/round1-findings.md`](docs/round1-findings.md)): 정합성 기준(전체 66건 중
   성공 3건뿐, 500 34건) 미충족 — 원인 미확인 상태로 로그 확인 후 재테스트 예정.
+- **2차 실행** ([`docs/round2-findings.md`](docs/round2-findings.md)): 1차의 500(34건)은 재현
+  안 됨(원인 불명인 채로 사라짐). 대신 기대 성공 건수(38건)보다 훨씬 적은 18건만 성공 — 관리자
+  API로는 `PENDING_PAYMENT` 상태를 조회할 수 없어 사후 재구성 불가 확인, `k6/scenario.js`에
+  시나리오별 결과 로그(`RESULT scenario=... status=... code=...`) 추가.
