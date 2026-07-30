@@ -73,9 +73,75 @@ org.springframework.transaction.CannotCreateTransactionException: Could not open
 
 ---
 
+### 지표별 실측값 정리
+
+| 지표 | 5차 실측값 |
+|---|---|
+| 정합성 | **통과** — A: 20건 중 정확히 6건 성공(`201`), 14건 정원초과(`409 C206`), 500 없음 |
+| 락 대기시간 | 직접 측정 안 함(`SHOW ENGINE INNODB STATUS` 미조회). 간접 추정: B0(VU=6, 풀 이내라 풀 대기 없음)의 응답시간이 곧 "락 대기 + Stripe 외부 호출 시간" — avg 1.53s, p95 2.67s |
+| p95 응답지연 | B0 2.67s / B1 3.41s / C 5.55s (p99는 k6 옵션 미설정이라 미계산) |
+| 데드락 | **미확인** — 조회 안 함. 서버 로그(`Unhandled exception`)에 데드락 관련 예외는 없었음 |
+| TPS | 전체 66건/약 66초 ≈ 0.998 req/s (k6 계산치) — 시나리오가 0/20/40/60초로 단계적으로 시작되므로 순간 최대 처리량이 아니라 전체 평균일 뿐 |
+| 커넥션 풀 대기시간 | 정확한 값(ms)은 미측정(HikariCP DEBUG 로그 미확인). 대신 풀 고갈로 인한 `CannotCreateTransactionException` 8건 확인(B1 2건, C 6건) |
+| CPU 쓰로틀링 | **미확인** — `cpu.stat` 조회 안 함 |
+| B0 p95 판정 | ❌ 목표치(200ms대) 크게 초과. 순수 락 대기가 아니라 락을 잡은 채로 같은 트랜잭션에서 Stripe PaymentIntent 생성까지 순차 실행하는 구조 때문일 가능성이 높음 — 서버 레포 코드 확인 필요(아직 안 함) |
+| B1 − C 판정 | avg 기준 2.82s − 3.41s = **−0.59s**, p95 기준 3.41s − 5.55s = **−2.14s** — 둘 다 음수. 락으로 인한 추가 지연은 관측 안 됨. C가 오히려 높은 건 C의 500(6건, 각각 3초 타임아웃까지 대기하다 실패)이 평균/p95를 끌어올렸기 때문 |
+
+---
+
+### 미측정 항목 — 다음 라운드 측정 계획
+
+데드락/CPU 쓰로틀링/정확한 커넥션 대기시간은 이번 라운드에서 안 봤다. 다음 라운드에서
+아래처럼 측정한다:
+
+- **데드락**: 서버 변경 필요 없음. k6 실행 직후 바로 조회.
+  ```bash
+  kubectl exec deployment/mysql -- mysql -uroot -p$DB_PASSWORD \
+    -e "SHOW ENGINE INNODB STATUS\G" | grep -A 30 "LATEST DETECTED DEADLOCK"
+  ```
+- **CPU 쓰로틀링**: `cpu.stat`의 `nr_throttled`/`throttled_time`은 컨테이너 시작 이후
+  누적값이라, **테스트 전/후 두 번 찍어서 차이(delta)를 봐야** 의미가 있다(한 번만 찍으면
+  이전 테스트나 실트래픽의 누적치와 섞여 무의미함).
+  ```bash
+  kubectl exec deployment/travelx-server -- cat /sys/fs/cgroup/cpu.stat > /tmp/cpu-before.txt
+  # ... k6 실행 ...
+  kubectl exec deployment/travelx-server -- cat /sys/fs/cgroup/cpu.stat > /tmp/cpu-after.txt
+  diff /tmp/cpu-before.txt /tmp/cpu-after.txt
+  ```
+- **HikariCP 정확한 대기시간**: `LOGGING_LEVEL_COM_ZAXXER_HIKARI=DEBUG`를 `DEV_AUTH_ENABLED=true`와
+  **같은 `kubectl set env` 호출에 같이 넣어서** 재기동을 한 번만 겪도록 한다:
+  ```bash
+  kubectl set env deployment/travelx-server DEV_AUTH_ENABLED=true LOGGING_LEVEL_COM_ZAXXER_HIKARI=DEBUG
+  ```
+
+---
+
+### JVM 워밍업(JIT) 고려사항
+
+이 테스트는 전체 66건뿐이라 HotSpot의 C2 컴파일 임계치(보통 수천~1만 회 호출)에 한참 못
+미친다 — `createReservation()` 경로가 인터프리터/C1 단계에 머물러 있었을 가능성이 높고,
+그러면 측정된 절대 지연시간(B0 p95 2.67s 등)이 실제 정상 운영 중인(충분히 워밍업된) 서버보다
+더 느리게 나왔을 수 있다.
+
+다만:
+- A/B0/B1/C가 전부 **같은 워밍업 상태에서 순차 실행**되므로, `B1 − C` 같은 **상대 비교(락 vs
+  풀 결론)는 이 영향을 크게 받지 않는다** — 다 같이 느려진 거면 상쇄된다.
+- 지금 보이는 수 초 단위 지연은 Stripe 외부 API 호출/락 대기/DB 커넥션 타임아웃(3초) 같은
+  **I/O 대기가 지배적**이라, CPU 바운드인 JIT 워밍업 효과는 상대적으로 작을 가능성이 높다.
+
+절대 수치를 더 신뢰성 있게 보고 싶다면, 본 측정 전에 별도의 버려질 웜업 지점에 30~50건
+정도 예약 요청을 먼저 흘려보내는 웜업 단계를 추가하는 걸 고려할 수 있다(실서버에 진짜
+예약이 더 생기는 비용은 있음) — 다음 라운드에서 필요 여부 결정.
+
+---
+
 ### 남은 것
 
 - [ ] 정리 필요: 테스트 지점 `branchId=40,41`(1차), `21`(2차), `22`(3차), `23`(중단된 4차 시도),
-      `24`(5차) 총 6개 — 전부 `scripts/cleanup.sh` + 수동 SQL로 정리
+      `24`(5차) 총 6개 — `scripts/cleanup.sh`(이제 `kubectl exec`로 실제 삭제까지 함)로 정리
 - [ ] `DEV_AUTH_ENABLED=false`로 원복 (계속 `true`로 켜진 채 방치됨 — 테스트 마무리되면 필수)
+- [ ] 다음 라운드: 데드락(`SHOW ENGINE INNODB STATUS`)/CPU 쓰로틀링(`cpu.stat` 전후 diff)/
+      HikariCP 정확한 대기시간(`LOGGING_LEVEL_COM_ZAXXER_HIKARI=DEBUG`) 측정
+- [ ] 다음 라운드: JVM 워밍업 단계를 넣을지 결정 (넣으면 절대 지연시간이 더 현실적으로 나옴,
+      단 실서버에 웜업용 예약이 추가로 생김)
 - [ ] (선택) 위 서버 개선 제안을 실제로 반영할지는 서버 팀과 별도 논의
